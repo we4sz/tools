@@ -69,42 +69,6 @@ func groupAdminEnabled(v string) bool {
 	}
 }
 
-// groupsFromBearerToken decodes a JWT bearer token (signature NOT verified —
-// the token was already validated by oauth2-proxy upstream) and extracts the
-// named claim as a list of group names. Returns nil when the token is opaque
-// (not a JWT) or the claim is absent, so the caller can fall back to userinfo.
-func groupsFromBearerToken(authHeader, claim string) []string {
-	tok := strings.TrimSpace(authHeader)
-	for _, p := range []string{"Bearer ", "bearer "} {
-		tok = strings.TrimPrefix(tok, p)
-	}
-	parts := strings.Split(tok, ".")
-	if len(parts) < 2 {
-		return nil
-	}
-	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
-	if err != nil {
-		if payload, err = base64.URLEncoding.DecodeString(parts[1]); err != nil {
-			return nil
-		}
-	}
-	var claims map[string]any
-	if err := json.Unmarshal(payload, &claims); err != nil {
-		return nil
-	}
-	arr, ok := claims[claim].([]any)
-	if !ok {
-		return nil
-	}
-	groups := make([]string, 0, len(arr))
-	for _, v := range arr {
-		if s, ok := v.(string); ok {
-			groups = append(groups, s)
-		}
-	}
-	return groups
-}
-
 type idpGroup struct {
 	ID            string     `json:"id"`
 	Name          string     `json:"name"`
@@ -375,33 +339,29 @@ func main() {
 		json.NewEncoder(w).Encode(groups)
 	})
 	// /obot-list-user-auth-groups: the groups a SPECIFIC user belongs to. Obot
-	// POSTs the provider user ID (Keycloak user UUID) as the request body and uses
-	// the result to sync that user's memberships — so we must return ONLY that
-	// user's groups. With the Keycloak group admin opted in we look them up via the
-	// admin API; otherwise we fall back to the groups claim in a forwarded token.
+	// POSTs the provider user ID as the request body and uses the result to sync
+	// that user's group memberships, so we must return ONLY that user's groups.
 	mux.HandleFunc("/obot-list-user-auth-groups", func(w http.ResponseWriter, r *http.Request) {
-		if keycloakGroupAdmin {
-			var userID string
-			if r.Body != nil {
-				body, _ := io.ReadAll(r.Body)
-				userID = strings.TrimSpace(string(body))
-			}
-			if groups, err := listKeycloakUserGroups(r.Context(), issuerURL, opts.ClientID, opts.ClientSecret, userID); err == nil {
-				json.NewEncoder(w).Encode(groups)
-				return
-			}
+		if !keycloakGroupAdmin {
+			// Generic OIDC has no per-user group endpoint; a user's groups reach Obot
+			// via the token's groups claim (surfaced by /obot-get-state). Signal "not
+			// implemented" like the OSS Google/GitHub providers do.
+			w.WriteHeader(http.StatusNotFound)
+			return
 		}
-		// Fallback for non-Keycloak IdPs: the caller's own groups from a forwarded
-		// token (JWT claim, then userinfo). Never returns the whole realm.
-		groupNames := groupsFromBearerToken(r.Header.Get("Authorization"), opts.GroupsClaim)
-		if groupNames == nil {
-			if userInfo, err := profile.FetchOIDCProfile(r.Context(), issuerURL, r.Header.Get("Authorization")); err == nil {
-				groupNames = userInfo.Groups
-			}
+		var userID string
+		if r.Body != nil {
+			body, _ := io.ReadAll(r.Body)
+			userID = strings.TrimSpace(string(body))
 		}
-		groups := make(state.GroupInfoList, 0, len(groupNames))
-		for _, g := range groupNames {
-			groups = append(groups, state.GroupInfo{ID: g, Name: g})
+		groups, err := listKeycloakUserGroups(r.Context(), issuerURL, opts.ClientID, opts.ClientSecret, userID)
+		if err != nil {
+			// Return an error (not an empty list) on a lookup failure: Obot treats an
+			// empty list as "user is in no groups" and deletes their memberships, so a
+			// transient Keycloak Admin API failure would wipe group memberships. An
+			// error makes Obot skip the sync and keep the existing memberships.
+			http.Error(w, fmt.Sprintf("failed to list user groups: %v", err), http.StatusBadGateway)
+			return
 		}
 		json.NewEncoder(w).Encode(groups)
 	})
