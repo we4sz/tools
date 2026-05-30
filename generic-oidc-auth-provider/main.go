@@ -2,11 +2,13 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -76,6 +78,89 @@ func groupsFromBearerToken(authHeader, claim string) []string {
 		}
 	}
 	return groups
+}
+
+type idpGroup struct {
+	Name      string     `json:"name"`
+	Path      string     `json:"path"`
+	SubGroups []idpGroup `json:"subGroups"`
+}
+
+// listIdPGroupsViaKeycloakAdmin enumerates realm groups through Keycloak's Admin
+// API using the OIDC client's own service-account (client_credentials). This is
+// how Obot's enterprise connectors populate the group picker; generic OIDC has
+// no group-list endpoint, so we offer it for Keycloak when the client has a
+// service account with `query-groups`/`view-users`. Returns an error (so the
+// caller falls back to per-user groups) for non-Keycloak issuers or missing
+// permissions. Group names are returned as IDs to match the token groups claim.
+func listIdPGroupsViaKeycloakAdmin(ctx context.Context, issuer, clientID, clientSecret, search string) (state.GroupInfoList, error) {
+	issuer = strings.TrimRight(issuer, "/")
+	idx := strings.Index(issuer, "/realms/")
+	if idx < 0 || clientSecret == "" {
+		return nil, fmt.Errorf("not a keycloak issuer or no client secret")
+	}
+	base := issuer[:idx]
+	realm := issuer[idx+len("/realms/"):]
+	if i := strings.IndexByte(realm, '/'); i >= 0 {
+		realm = realm[:i]
+	}
+
+	// client_credentials token from the OIDC client's service account
+	form := url.Values{"grant_type": {"client_credentials"}, "client_id": {clientID}, "client_secret": {clientSecret}}
+	tokReq, err := http.NewRequestWithContext(ctx, http.MethodPost, issuer+"/protocol/openid-connect/token", strings.NewReader(form.Encode()))
+	if err != nil {
+		return nil, err
+	}
+	tokReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	client := &http.Client{Timeout: 15 * time.Second}
+	tokResp, err := client.Do(tokReq)
+	if err != nil {
+		return nil, err
+	}
+	defer tokResp.Body.Close()
+	if tokResp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("client_credentials token request returned %d", tokResp.StatusCode)
+	}
+	var tok struct {
+		AccessToken string `json:"access_token"`
+	}
+	if err = json.NewDecoder(tokResp.Body).Decode(&tok); err != nil || tok.AccessToken == "" {
+		return nil, fmt.Errorf("no service-account token")
+	}
+
+	groupsURL := fmt.Sprintf("%s/admin/realms/%s/groups?briefRepresentation=true&max=1000", base, realm)
+	if search != "" {
+		groupsURL += "&search=" + url.QueryEscape(search)
+	}
+	gReq, err := http.NewRequestWithContext(ctx, http.MethodGet, groupsURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	gReq.Header.Set("Authorization", "Bearer "+tok.AccessToken)
+	gResp, err := client.Do(gReq)
+	if err != nil {
+		return nil, err
+	}
+	defer gResp.Body.Close()
+	if gResp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("admin groups query returned %d", gResp.StatusCode)
+	}
+	var roots []idpGroup
+	if err = json.NewDecoder(gResp.Body).Decode(&roots); err != nil {
+		return nil, err
+	}
+
+	out := state.GroupInfoList{}
+	var walk func([]idpGroup)
+	walk = func(gs []idpGroup) {
+		for _, g := range gs {
+			// ID = leaf name to match the token's groups claim (full.path=false)
+			out = append(out, state.GroupInfo{ID: g.Name, Name: g.Name})
+			walk(g.SubGroups)
+		}
+	}
+	walk(roots)
+	return out, nil
 }
 
 func main() {
@@ -192,6 +277,13 @@ func main() {
 		// it needs no network call and keeps working even if the access token is
 		// near/just expired (avoids spurious userinfo 401s). Fall back to the
 		// userinfo endpoint for providers that issue opaque access tokens.
+		// Preferred: enumerate realm groups via the IdP admin API (Keycloak) so
+		// Obot can populate the group picker for group-scoped registries/roles.
+		if groups, err := listIdPGroupsViaKeycloakAdmin(r.Context(), issuerURL, opts.ClientID, opts.ClientSecret, r.URL.Query().Get("name")); err == nil {
+			json.NewEncoder(w).Encode(groups)
+			return
+		}
+		// Fallback: the caller's own groups from their token (JWT claim, then userinfo).
 		groupNames := groupsFromBearerToken(r.Header.Get("Authorization"), opts.GroupsClaim)
 		if groupNames == nil {
 			if userInfo, err := profile.FetchOIDCProfile(r.Context(), issuerURL, r.Header.Get("Authorization")); err == nil {
