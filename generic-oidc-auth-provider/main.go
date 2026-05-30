@@ -148,7 +148,21 @@ func main() {
 		json.NewEncoder(w).Encode(userInfo)
 	})
 	mux.HandleFunc("/obot-list-user-auth-groups", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusNotFound)
+		// Return the caller's groups (from the configured groups claim) so Obot
+		// can surface them for group-scoped registries and group role assignments.
+		// Generic OIDC has no "list all groups" endpoint, so this reports the
+		// authenticated user's own groups — enough for Obot to enumerate the
+		// groups it has seen across logins.
+		userInfo, err := profile.FetchOIDCProfile(r.Context(), issuerURL, r.Header.Get("Authorization"))
+		if err != nil {
+			http.Error(w, fmt.Sprintf("failed to fetch user info: %v", err), http.StatusBadRequest)
+			return
+		}
+		groups := make(state.GroupInfoList, 0, len(userInfo.Groups))
+		for _, g := range userInfo.Groups {
+			groups = append(groups, state.GroupInfo{ID: g, Name: g})
+		}
+		json.NewEncoder(w).Encode(groups)
 	})
 	mux.HandleFunc("/", oauthProxy.ServeHTTP)
 
