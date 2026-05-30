@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"os"
@@ -88,29 +89,75 @@ type idpGroup struct {
 	SubGroups     []idpGroup `json:"subGroups"`
 }
 
-// fetchKeycloakChildren returns the direct children of a Keycloak group.
-// Keycloak (v23+) does not inline subGroups in the groups listing, so nested
-// groups must be fetched via the /children endpoint.
-func fetchKeycloakChildren(ctx context.Context, client *http.Client, base, realm, token, groupID string) []idpGroup {
-	u := fmt.Sprintf("%s/admin/realms/%s/groups/%s/children?briefRepresentation=true&max=1000", base, realm, url.PathEscape(groupID))
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
-	if err != nil {
-		return nil
+var keycloakHTTP = &http.Client{Timeout: 15 * time.Second}
+
+// keycloakAdmin parses a Keycloak issuer into base+realm and obtains a service-
+// account access token via client_credentials. Returns an error for non-Keycloak
+// issuers or when no client secret is configured, so callers can fall back.
+func keycloakAdmin(ctx context.Context, issuer, clientID, clientSecret string) (base, realm, token string, err error) {
+	issuer = strings.TrimRight(issuer, "/")
+	idx := strings.Index(issuer, "/realms/")
+	if idx < 0 || clientSecret == "" {
+		return "", "", "", fmt.Errorf("not a keycloak issuer or no client secret")
 	}
-	req.Header.Set("Authorization", "Bearer "+token)
-	resp, err := client.Do(req)
+	base = issuer[:idx]
+	realm = issuer[idx+len("/realms/"):]
+	if i := strings.IndexByte(realm, '/'); i >= 0 {
+		realm = realm[:i]
+	}
+
+	form := url.Values{"grant_type": {"client_credentials"}, "client_id": {clientID}, "client_secret": {clientSecret}}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, issuer+"/protocol/openid-connect/token", strings.NewReader(form.Encode()))
 	if err != nil {
-		return nil
+		return "", "", "", err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	resp, err := keycloakHTTP.Do(req)
+	if err != nil {
+		return "", "", "", err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil
+		return "", "", "", fmt.Errorf("client_credentials token request returned %d", resp.StatusCode)
 	}
-	var children []idpGroup
-	if err = json.NewDecoder(resp.Body).Decode(&children); err != nil {
-		return nil
+	var tok struct {
+		AccessToken string `json:"access_token"`
 	}
-	return children
+	if err = json.NewDecoder(resp.Body).Decode(&tok); err != nil || tok.AccessToken == "" {
+		return "", "", "", fmt.Errorf("no service-account token")
+	}
+	return base, realm, tok.AccessToken, nil
+}
+
+// groupDisplayName renders a Keycloak group path as "parent / child" so nested
+// groups read as subgroups in Obot's flat picker (e.g. "offices / DEVBORAS").
+func groupDisplayName(path, leaf string) string {
+	if path == "" {
+		return leaf
+	}
+	return strings.ReplaceAll(strings.TrimPrefix(path, "/"), "/", " / ")
+}
+
+// fetchKeycloakGroups GETs a Keycloak admin groups endpoint and decodes the list.
+func fetchKeycloakGroups(ctx context.Context, token, endpoint string) ([]idpGroup, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := keycloakHTTP.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("keycloak admin query %s returned %d", endpoint, resp.StatusCode)
+	}
+	var groups []idpGroup
+	if err = json.NewDecoder(resp.Body).Decode(&groups); err != nil {
+		return nil, err
+	}
+	return groups, nil
 }
 
 // listIdPGroupsViaKeycloakAdmin enumerates realm groups through Keycloak's Admin
@@ -121,82 +168,64 @@ func fetchKeycloakChildren(ctx context.Context, client *http.Client, base, realm
 // caller falls back to per-user groups) for non-Keycloak issuers or missing
 // permissions. Group names are returned as IDs to match the token groups claim.
 func listIdPGroupsViaKeycloakAdmin(ctx context.Context, issuer, clientID, clientSecret, search string) (state.GroupInfoList, error) {
-	issuer = strings.TrimRight(issuer, "/")
-	idx := strings.Index(issuer, "/realms/")
-	if idx < 0 || clientSecret == "" {
-		return nil, fmt.Errorf("not a keycloak issuer or no client secret")
-	}
-	base := issuer[:idx]
-	realm := issuer[idx+len("/realms/"):]
-	if i := strings.IndexByte(realm, '/'); i >= 0 {
-		realm = realm[:i]
-	}
-
-	// client_credentials token from the OIDC client's service account
-	form := url.Values{"grant_type": {"client_credentials"}, "client_id": {clientID}, "client_secret": {clientSecret}}
-	tokReq, err := http.NewRequestWithContext(ctx, http.MethodPost, issuer+"/protocol/openid-connect/token", strings.NewReader(form.Encode()))
+	base, realm, token, err := keycloakAdmin(ctx, issuer, clientID, clientSecret)
 	if err != nil {
 		return nil, err
-	}
-	tokReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	client := &http.Client{Timeout: 15 * time.Second}
-	tokResp, err := client.Do(tokReq)
-	if err != nil {
-		return nil, err
-	}
-	defer tokResp.Body.Close()
-	if tokResp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("client_credentials token request returned %d", tokResp.StatusCode)
-	}
-	var tok struct {
-		AccessToken string `json:"access_token"`
-	}
-	if err = json.NewDecoder(tokResp.Body).Decode(&tok); err != nil || tok.AccessToken == "" {
-		return nil, fmt.Errorf("no service-account token")
 	}
 
 	groupsURL := fmt.Sprintf("%s/admin/realms/%s/groups?briefRepresentation=true&max=1000", base, realm)
 	if search != "" {
 		groupsURL += "&search=" + url.QueryEscape(search)
 	}
-	gReq, err := http.NewRequestWithContext(ctx, http.MethodGet, groupsURL, nil)
+	roots, err := fetchKeycloakGroups(ctx, token, groupsURL)
 	if err != nil {
-		return nil, err
-	}
-	gReq.Header.Set("Authorization", "Bearer "+tok.AccessToken)
-	gResp, err := client.Do(gReq)
-	if err != nil {
-		return nil, err
-	}
-	defer gResp.Body.Close()
-	if gResp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("admin groups query returned %d", gResp.StatusCode)
-	}
-	var roots []idpGroup
-	if err = json.NewDecoder(gResp.Body).Decode(&roots); err != nil {
 		return nil, err
 	}
 
+	// Keycloak (v23+) does not inline subGroups in the groups listing — it returns
+	// only subGroupCount — so nested groups are fetched via the /children endpoint.
 	out := state.GroupInfoList{}
 	var walk func([]idpGroup)
 	walk = func(gs []idpGroup) {
 		for _, g := range gs {
-			// ID = leaf name to match the token's groups claim (full.path=false).
-			// Name = the group's path rendered as "parent / child" so nested groups
-			// read as subgroups in Obot's flat picker (e.g. "offices / DEVBORAS").
-			display := g.Name
-			if g.Path != "" {
-				display = strings.ReplaceAll(strings.TrimPrefix(g.Path, "/"), "/", " / ")
-			}
-			out = append(out, state.GroupInfo{ID: g.Name, Name: display})
+			// ID = leaf name to match the token's groups claim (full.path=false);
+			// Name = hierarchical path so subgroups read as such in the picker.
+			out = append(out, state.GroupInfo{ID: g.Name, Name: groupDisplayName(g.Path, g.Name)})
 			children := g.SubGroups
 			if len(children) == 0 && g.SubGroupCount > 0 && g.ID != "" {
-				children = fetchKeycloakChildren(ctx, client, base, realm, tok.AccessToken, g.ID)
+				if kids, err := fetchKeycloakGroups(ctx, token,
+					fmt.Sprintf("%s/admin/realms/%s/groups/%s/children?briefRepresentation=true&max=1000", base, realm, url.PathEscape(g.ID))); err == nil {
+					children = kids
+				}
 			}
 			walk(children)
 		}
 	}
 	walk(roots)
+	return out, nil
+}
+
+// listKeycloakUserGroups returns the groups a SPECIFIC user (by Keycloak user
+// UUID) belongs to, via the admin API. Obot calls /obot-list-user-auth-groups to
+// sync per-user memberships, so this MUST return only that user's groups — never
+// the whole realm (that would make every user a member of every group).
+func listKeycloakUserGroups(ctx context.Context, issuer, clientID, clientSecret, userID string) (state.GroupInfoList, error) {
+	if userID == "" {
+		return nil, fmt.Errorf("no user id")
+	}
+	base, realm, token, err := keycloakAdmin(ctx, issuer, clientID, clientSecret)
+	if err != nil {
+		return nil, err
+	}
+	groups, err := fetchKeycloakGroups(ctx, token,
+		fmt.Sprintf("%s/admin/realms/%s/users/%s/groups?briefRepresentation=true&max=1000", base, realm, url.PathEscape(userID)))
+	if err != nil {
+		return nil, err
+	}
+	out := make(state.GroupInfoList, 0, len(groups))
+	for _, g := range groups {
+		out = append(out, state.GroupInfo{ID: g.Name, Name: groupDisplayName(g.Path, g.Name)})
+	}
 	return out, nil
 }
 
@@ -305,22 +334,33 @@ func main() {
 
 		json.NewEncoder(w).Encode(userInfo)
 	})
+	// /obot-list-auth-groups: enumerate ALL realm groups for the admin group
+	// picker (group-scoped registries / role assignments). Obot merges this with
+	// its DB cache, so on error we return an empty list rather than failing.
+	mux.HandleFunc("/obot-list-auth-groups", func(w http.ResponseWriter, r *http.Request) {
+		groups, err := listIdPGroupsViaKeycloakAdmin(r.Context(), issuerURL, opts.ClientID, opts.ClientSecret, r.URL.Query().Get("name"))
+		if err != nil {
+			groups = state.GroupInfoList{}
+		}
+		json.NewEncoder(w).Encode(groups)
+	})
+	// /obot-list-user-auth-groups: the groups a SPECIFIC user belongs to. Obot
+	// POSTs the provider user ID (Keycloak user UUID) as the request body and uses
+	// the result to sync that user's memberships — so we must return ONLY that
+	// user's groups. For Keycloak we look them up via the admin API; otherwise we
+	// fall back to the groups claim in a bearer token if one was forwarded.
 	mux.HandleFunc("/obot-list-user-auth-groups", func(w http.ResponseWriter, r *http.Request) {
-		// Return the caller's groups so Obot can surface them for group-scoped
-		// registries and group role assignments. Generic OIDC has no "list all
-		// groups" endpoint, so this reports the authenticated user's own groups.
-		//
-		// Prefer decoding the groups claim straight from the (JWT) access token:
-		// it needs no network call and keeps working even if the access token is
-		// near/just expired (avoids spurious userinfo 401s). Fall back to the
-		// userinfo endpoint for providers that issue opaque access tokens.
-		// Preferred: enumerate realm groups via the IdP admin API (Keycloak) so
-		// Obot can populate the group picker for group-scoped registries/roles.
-		if groups, err := listIdPGroupsViaKeycloakAdmin(r.Context(), issuerURL, opts.ClientID, opts.ClientSecret, r.URL.Query().Get("name")); err == nil {
+		var userID string
+		if r.Body != nil {
+			body, _ := io.ReadAll(r.Body)
+			userID = strings.TrimSpace(string(body))
+		}
+		if groups, err := listKeycloakUserGroups(r.Context(), issuerURL, opts.ClientID, opts.ClientSecret, userID); err == nil {
 			json.NewEncoder(w).Encode(groups)
 			return
 		}
-		// Fallback: the caller's own groups from their token (JWT claim, then userinfo).
+		// Fallback for non-Keycloak IdPs: the caller's own groups from a forwarded
+		// token (JWT claim, then userinfo). Never returns the whole realm.
 		groupNames := groupsFromBearerToken(r.Header.Get("Authorization"), opts.GroupsClaim)
 		if groupNames == nil {
 			if userInfo, err := profile.FetchOIDCProfile(r.Context(), issuerURL, r.Header.Get("Authorization")); err == nil {
