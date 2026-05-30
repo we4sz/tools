@@ -42,6 +42,42 @@ type Options struct {
 	LoggingEnabled           string `usage:"Enable oauth2-proxy logging" optional:"true" env:"OBOT_AUTH_PROVIDER_ENABLE_LOGGING"`
 }
 
+// groupsFromBearerToken decodes a JWT bearer token (signature NOT verified —
+// the token was already validated by oauth2-proxy upstream) and extracts the
+// named claim as a list of group names. Returns nil when the token is opaque
+// (not a JWT) or the claim is absent, so the caller can fall back to userinfo.
+func groupsFromBearerToken(authHeader, claim string) []string {
+	tok := strings.TrimSpace(authHeader)
+	for _, p := range []string{"Bearer ", "bearer "} {
+		tok = strings.TrimPrefix(tok, p)
+	}
+	parts := strings.Split(tok, ".")
+	if len(parts) < 2 {
+		return nil
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		if payload, err = base64.URLEncoding.DecodeString(parts[1]); err != nil {
+			return nil
+		}
+	}
+	var claims map[string]any
+	if err := json.Unmarshal(payload, &claims); err != nil {
+		return nil
+	}
+	arr, ok := claims[claim].([]any)
+	if !ok {
+		return nil
+	}
+	groups := make([]string, 0, len(arr))
+	for _, v := range arr {
+		if s, ok := v.(string); ok {
+			groups = append(groups, s)
+		}
+	}
+	return groups
+}
+
 func main() {
 	var opts Options
 	if err := env.LoadEnvForStruct(&opts); err != nil {
@@ -148,18 +184,22 @@ func main() {
 		json.NewEncoder(w).Encode(userInfo)
 	})
 	mux.HandleFunc("/obot-list-user-auth-groups", func(w http.ResponseWriter, r *http.Request) {
-		// Return the caller's groups (from the configured groups claim) so Obot
-		// can surface them for group-scoped registries and group role assignments.
-		// Generic OIDC has no "list all groups" endpoint, so this reports the
-		// authenticated user's own groups — enough for Obot to enumerate the
-		// groups it has seen across logins.
-		userInfo, err := profile.FetchOIDCProfile(r.Context(), issuerURL, r.Header.Get("Authorization"))
-		if err != nil {
-			http.Error(w, fmt.Sprintf("failed to fetch user info: %v", err), http.StatusBadRequest)
-			return
+		// Return the caller's groups so Obot can surface them for group-scoped
+		// registries and group role assignments. Generic OIDC has no "list all
+		// groups" endpoint, so this reports the authenticated user's own groups.
+		//
+		// Prefer decoding the groups claim straight from the (JWT) access token:
+		// it needs no network call and keeps working even if the access token is
+		// near/just expired (avoids spurious userinfo 401s). Fall back to the
+		// userinfo endpoint for providers that issue opaque access tokens.
+		groupNames := groupsFromBearerToken(r.Header.Get("Authorization"), opts.GroupsClaim)
+		if groupNames == nil {
+			if userInfo, err := profile.FetchOIDCProfile(r.Context(), issuerURL, r.Header.Get("Authorization")); err == nil {
+				groupNames = userInfo.Groups
+			}
 		}
-		groups := make(state.GroupInfoList, 0, len(userInfo.Groups))
-		for _, g := range userInfo.Groups {
+		groups := make(state.GroupInfoList, 0, len(groupNames))
+		for _, g := range groupNames {
 			groups = append(groups, state.GroupInfo{ID: g, Name: g})
 		}
 		json.NewEncoder(w).Encode(groups)
