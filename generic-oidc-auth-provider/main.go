@@ -126,26 +126,47 @@ func groupDisplayName(path, leaf string) string {
 	return strings.ReplaceAll(strings.TrimPrefix(path, "/"), "/", " / ")
 }
 
-// fetchKeycloakGroups GETs a Keycloak admin groups endpoint and decodes the list.
+// keycloakPageSize is the number of groups requested per Keycloak admin API page.
+const keycloakPageSize = 100
+
+// fetchKeycloakGroups GETs a Keycloak admin groups endpoint and decodes the list,
+// following Keycloak's first/max pagination until a short (final) page is returned
+// so realms/children/memberships larger than one page are fully enumerated. The
+// endpoint may already carry query params (e.g. briefRepresentation, search); the
+// paging params are appended.
 func fetchKeycloakGroups(ctx context.Context, token, endpoint string) ([]idpGroup, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
-	if err != nil {
-		return nil, err
+	sep := "&"
+	if !strings.Contains(endpoint, "?") {
+		sep = "?"
 	}
-	req.Header.Set("Authorization", "Bearer "+token)
-	resp, err := keycloakHTTP.Do(req)
-	if err != nil {
-		return nil, err
+	var all []idpGroup
+	for first := 0; ; first += keycloakPageSize {
+		u := fmt.Sprintf("%s%sfirst=%d&max=%d", endpoint, sep, first, keycloakPageSize)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Authorization", "Bearer "+token)
+		resp, err := keycloakHTTP.Do(req)
+		if err != nil {
+			return nil, err
+		}
+		if resp.StatusCode != http.StatusOK {
+			resp.Body.Close()
+			return nil, fmt.Errorf("keycloak admin query %s returned %d", endpoint, resp.StatusCode)
+		}
+		var page []idpGroup
+		err = json.NewDecoder(resp.Body).Decode(&page)
+		resp.Body.Close()
+		if err != nil {
+			return nil, err
+		}
+		all = append(all, page...)
+		if len(page) < keycloakPageSize {
+			break
+		}
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("keycloak admin query %s returned %d", endpoint, resp.StatusCode)
-	}
-	var groups []idpGroup
-	if err = json.NewDecoder(resp.Body).Decode(&groups); err != nil {
-		return nil, err
-	}
-	return groups, nil
+	return all, nil
 }
 
 // listIdPGroupsViaKeycloakAdmin enumerates realm groups through Keycloak's Admin
@@ -161,7 +182,7 @@ func listIdPGroupsViaKeycloakAdmin(ctx context.Context, issuer, clientID, client
 		return nil, err
 	}
 
-	groupsURL := fmt.Sprintf("%s/admin/realms/%s/groups?briefRepresentation=true&max=1000", base, realm)
+	groupsURL := fmt.Sprintf("%s/admin/realms/%s/groups?briefRepresentation=true", base, realm)
 	if search != "" {
 		groupsURL += "&search=" + url.QueryEscape(search)
 	}
@@ -182,7 +203,7 @@ func listIdPGroupsViaKeycloakAdmin(ctx context.Context, issuer, clientID, client
 			children := g.SubGroups
 			if len(children) == 0 && g.SubGroupCount > 0 && g.ID != "" {
 				if kids, err := fetchKeycloakGroups(ctx, token,
-					fmt.Sprintf("%s/admin/realms/%s/groups/%s/children?briefRepresentation=true&max=1000", base, realm, url.PathEscape(g.ID))); err == nil {
+					fmt.Sprintf("%s/admin/realms/%s/groups/%s/children?briefRepresentation=true", base, realm, url.PathEscape(g.ID))); err == nil {
 					children = kids
 				}
 			}
@@ -206,7 +227,7 @@ func listKeycloakUserGroups(ctx context.Context, issuer, clientID, clientSecret,
 		return nil, err
 	}
 	groups, err := fetchKeycloakGroups(ctx, token,
-		fmt.Sprintf("%s/admin/realms/%s/users/%s/groups?briefRepresentation=true&max=1000", base, realm, url.PathEscape(userID)))
+		fmt.Sprintf("%s/admin/realms/%s/users/%s/groups?briefRepresentation=true", base, realm, url.PathEscape(userID)))
 	if err != nil {
 		return nil, err
 	}
