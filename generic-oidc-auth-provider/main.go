@@ -181,8 +181,14 @@ func listIdPGroupsViaKeycloakAdmin(ctx context.Context, issuer, clientID, client
 	var walk func([]idpGroup)
 	walk = func(gs []idpGroup) {
 		for _, g := range gs {
-			// ID = leaf name to match the token's groups claim (full.path=false)
-			out = append(out, state.GroupInfo{ID: g.Name, Name: g.Name})
+			// ID = leaf name to match the token's groups claim (full.path=false).
+			// Name = the group's path rendered as "parent / child" so nested groups
+			// read as subgroups in Obot's flat picker (e.g. "offices / DEVBORAS").
+			display := g.Name
+			if g.Path != "" {
+				display = strings.ReplaceAll(strings.TrimPrefix(g.Path, "/"), "/", " / ")
+			}
+			out = append(out, state.GroupInfo{ID: g.Name, Name: display})
 			children := g.SubGroups
 			if len(children) == 0 && g.SubGroupCount > 0 && g.ID != "" {
 				children = fetchKeycloakChildren(ctx, client, base, realm, tok.AccessToken, g.ID)
