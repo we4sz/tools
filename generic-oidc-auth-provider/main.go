@@ -81,9 +81,36 @@ func groupsFromBearerToken(authHeader, claim string) []string {
 }
 
 type idpGroup struct {
-	Name      string     `json:"name"`
-	Path      string     `json:"path"`
-	SubGroups []idpGroup `json:"subGroups"`
+	ID            string     `json:"id"`
+	Name          string     `json:"name"`
+	Path          string     `json:"path"`
+	SubGroupCount int        `json:"subGroupCount"`
+	SubGroups     []idpGroup `json:"subGroups"`
+}
+
+// fetchKeycloakChildren returns the direct children of a Keycloak group.
+// Keycloak (v23+) does not inline subGroups in the groups listing, so nested
+// groups must be fetched via the /children endpoint.
+func fetchKeycloakChildren(ctx context.Context, client *http.Client, base, realm, token, groupID string) []idpGroup {
+	u := fmt.Sprintf("%s/admin/realms/%s/groups/%s/children?briefRepresentation=true&max=1000", base, realm, url.PathEscape(groupID))
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return nil
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil
+	}
+	var children []idpGroup
+	if err = json.NewDecoder(resp.Body).Decode(&children); err != nil {
+		return nil
+	}
+	return children
 }
 
 // listIdPGroupsViaKeycloakAdmin enumerates realm groups through Keycloak's Admin
@@ -156,7 +183,11 @@ func listIdPGroupsViaKeycloakAdmin(ctx context.Context, issuer, clientID, client
 		for _, g := range gs {
 			// ID = leaf name to match the token's groups claim (full.path=false)
 			out = append(out, state.GroupInfo{ID: g.Name, Name: g.Name})
-			walk(g.SubGroups)
+			children := g.SubGroups
+			if len(children) == 0 && g.SubGroupCount > 0 && g.ID != "" {
+				children = fetchKeycloakChildren(ctx, client, base, realm, tok.AccessToken, g.ID)
+			}
+			walk(children)
 		}
 	}
 	walk(roots)
