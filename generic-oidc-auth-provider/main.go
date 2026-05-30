@@ -1,0 +1,160 @@
+package main
+
+import (
+	"bytes"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"os"
+	"strings"
+	"time"
+
+	oauth2proxy "github.com/oauth2-proxy/oauth2-proxy/v7"
+	"github.com/oauth2-proxy/oauth2-proxy/v7/pkg/apis/options"
+	"github.com/oauth2-proxy/oauth2-proxy/v7/pkg/validation"
+	"github.com/obot-platform/tools/auth-providers-common/pkg/env"
+	"github.com/obot-platform/tools/auth-providers-common/pkg/state"
+	"github.com/obot-platform/tools/generic-oidc-auth-provider/pkg/profile"
+)
+
+type Options struct {
+	ClientID     string `env:"OBOT_OIDC_AUTH_PROVIDER_CLIENT_ID"`
+	ClientSecret string `env:"OBOT_OIDC_AUTH_PROVIDER_CLIENT_SECRET"`
+	// IssuerURL is the OIDC issuer (e.g. https://auth.example.com/realms/myrealm).
+	// oauth2-proxy performs discovery against {IssuerURL}/.well-known/openid-configuration.
+	IssuerURL string `env:"OBOT_OIDC_AUTH_PROVIDER_ISSUER_URL"`
+	// Scopes requested at login. "openid" is required; email/profile recommended.
+	Scopes string `env:"OBOT_OIDC_AUTH_PROVIDER_SCOPES" default:"openid email profile" optional:"true"`
+	// Claim names — defaults match the OIDC spec / Keycloak conventions.
+	EmailClaim  string `env:"OBOT_OIDC_AUTH_PROVIDER_EMAIL_CLAIM" default:"email" optional:"true"`
+	GroupsClaim string `env:"OBOT_OIDC_AUTH_PROVIDER_GROUPS_CLAIM" default:"groups" optional:"true"`
+	// AllowUnverifiedEmail lets users without email_verified=true sign in.
+	// Many self-hosted IdPs (e.g. Keycloak) do not set email_verified by default.
+	AllowUnverifiedEmail string `env:"OBOT_OIDC_AUTH_PROVIDER_ALLOW_UNVERIFIED_EMAIL" default:"true" optional:"true"`
+
+	ObotServerURL            string `env:"OBOT_SERVER_PUBLIC_URL,OBOT_SERVER_URL"`
+	PostgresConnectionDSN    string `env:"OBOT_AUTH_PROVIDER_POSTGRES_CONNECTION_DSN" optional:"true"`
+	AuthCookieSecret         string `usage:"Secret used to encrypt cookie" env:"OBOT_AUTH_PROVIDER_COOKIE_SECRET"`
+	AuthEmailDomains         string `usage:"Email domains allowed for authentication" default:"*" env:"OBOT_AUTH_PROVIDER_EMAIL_DOMAINS"`
+	AuthTokenRefreshDuration string `usage:"Duration to refresh auth token after" optional:"true" default:"1h" env:"OBOT_AUTH_PROVIDER_TOKEN_REFRESH_DURATION"`
+	LoggingEnabled           string `usage:"Enable oauth2-proxy logging" optional:"true" env:"OBOT_AUTH_PROVIDER_ENABLE_LOGGING"`
+}
+
+func main() {
+	var opts Options
+	if err := env.LoadEnvForStruct(&opts); err != nil {
+		fmt.Printf("ERROR: generic-oidc-auth-provider: failed to load options: %v\n", err)
+		os.Exit(1)
+	}
+
+	if opts.IssuerURL == "" {
+		fmt.Printf("ERROR: generic-oidc-auth-provider: OBOT_OIDC_AUTH_PROVIDER_ISSUER_URL is required\n")
+		os.Exit(1)
+	}
+
+	refreshDuration, err := time.ParseDuration(opts.AuthTokenRefreshDuration)
+	if err != nil {
+		fmt.Printf("ERROR: generic-oidc-auth-provider: failed to parse token refresh duration: %v\n", err)
+		os.Exit(1)
+	}
+
+	if refreshDuration < 0 {
+		fmt.Printf("ERROR: generic-oidc-auth-provider: token refresh duration must be greater than 0\n")
+		os.Exit(1)
+	}
+
+	cookieSecret, err := base64.StdEncoding.DecodeString(opts.AuthCookieSecret)
+	if err != nil {
+		fmt.Printf("ERROR: generic-oidc-auth-provider: failed to decode cookie secret: %v\n", err)
+		os.Exit(1)
+	}
+
+	legacyOpts := options.NewLegacyOptions()
+	legacyOpts.LegacyProvider.ProviderType = "oidc"
+	legacyOpts.LegacyProvider.ProviderName = "oidc"
+	legacyOpts.LegacyProvider.ClientID = opts.ClientID
+	legacyOpts.LegacyProvider.ClientSecret = opts.ClientSecret
+	legacyOpts.LegacyProvider.OIDCIssuerURL = opts.IssuerURL
+	legacyOpts.LegacyProvider.Scope = opts.Scopes
+	legacyOpts.LegacyProvider.OIDCEmailClaim = opts.EmailClaim
+	legacyOpts.LegacyProvider.OIDCGroupsClaim = opts.GroupsClaim
+	legacyOpts.LegacyProvider.InsecureOIDCAllowUnverifiedEmail = strings.EqualFold(opts.AllowUnverifiedEmail, "true")
+
+	oauthProxyOpts, err := legacyOpts.ToOptions()
+	if err != nil {
+		fmt.Printf("ERROR: generic-oidc-auth-provider: failed to convert legacy options to new options: %v\n", err)
+		os.Exit(1)
+	}
+
+	oauthProxyOpts.Server.BindAddress = ""
+	oauthProxyOpts.MetricsServer.BindAddress = ""
+	if opts.PostgresConnectionDSN != "" {
+		oauthProxyOpts.Session.Type = options.PostgresSessionStoreType
+		oauthProxyOpts.Session.Postgres.ConnectionDSN = opts.PostgresConnectionDSN
+		oauthProxyOpts.Session.Postgres.TableNamePrefix = "oidc_"
+	}
+	oauthProxyOpts.Cookie.Refresh = refreshDuration
+	oauthProxyOpts.Cookie.Name = "obot_access_token"
+	oauthProxyOpts.Cookie.Secret = string(bytes.TrimSpace(cookieSecret))
+	oauthProxyOpts.Cookie.Secure = strings.HasPrefix(opts.ObotServerURL, "https://")
+	oauthProxyOpts.Cookie.CSRFExpire = 30 * time.Minute
+	oauthProxyOpts.Templates.Path = os.Getenv("GPTSCRIPT_TOOL_DIR") + "/../auth-providers-common/templates"
+	oauthProxyOpts.RawRedirectURL = opts.ObotServerURL + "/"
+	if opts.AuthEmailDomains != "" {
+		emailDomains := strings.Split(opts.AuthEmailDomains, ",")
+		for i := range emailDomains {
+			emailDomains[i] = strings.TrimSpace(emailDomains[i])
+		}
+		oauthProxyOpts.EmailDomains = emailDomains
+	}
+
+	loggingEnabled := strings.EqualFold(opts.LoggingEnabled, "true")
+	oauthProxyOpts.Logging.RequestEnabled = loggingEnabled
+	oauthProxyOpts.Logging.AuthEnabled = loggingEnabled
+	oauthProxyOpts.Logging.StandardEnabled = loggingEnabled
+
+	if err = validation.Validate(oauthProxyOpts); err != nil {
+		fmt.Printf("ERROR: generic-oidc-auth-provider: failed to validate options: %v\n", err)
+		os.Exit(1)
+	}
+
+	oauthProxy, err := oauth2proxy.NewOAuthProxy(oauthProxyOpts, oauth2proxy.NewValidator(oauthProxyOpts.EmailDomains, oauthProxyOpts.AuthenticatedEmailsFile))
+	if err != nil {
+		fmt.Printf("ERROR: generic-oidc-auth-provider: failed to create oauth2 proxy: %v\n", err)
+		os.Exit(1)
+	}
+
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "9999"
+	}
+
+	issuerURL := strings.TrimRight(opts.IssuerURL, "/")
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/{$}", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(fmt.Sprintf("http://127.0.0.1:%s", port)))
+	})
+	mux.HandleFunc("/obot-get-state", state.ObotGetState(oauthProxy))
+	mux.HandleFunc("/obot-get-user-info", func(w http.ResponseWriter, r *http.Request) {
+		userInfo, err := profile.FetchOIDCProfile(r.Context(), issuerURL, r.Header.Get("Authorization"))
+		if err != nil {
+			http.Error(w, fmt.Sprintf("failed to fetch user info: %v", err), http.StatusBadRequest)
+			return
+		}
+
+		json.NewEncoder(w).Encode(userInfo)
+	})
+	mux.HandleFunc("/obot-list-user-auth-groups", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	})
+	mux.HandleFunc("/", oauthProxy.ServeHTTP)
+
+	fmt.Printf("listening on 127.0.0.1:%s\n", port)
+	if err := http.ListenAndServe("127.0.0.1:"+port, mux); !errors.Is(err, http.ErrServerClosed) {
+		fmt.Printf("ERROR: generic-oidc-auth-provider: failed to listen and serve: %v\n", err)
+		os.Exit(1)
+	}
+}

@@ -1,0 +1,94 @@
+Name: OpenID Connect
+Description: Generic OpenID Connect auth provider (works with Keycloak, Authentik, Dex, Auth0, and any OIDC-compliant IdP)
+Metadata: envVars: OBOT_OIDC_AUTH_PROVIDER_CLIENT_ID,OBOT_OIDC_AUTH_PROVIDER_CLIENT_SECRET,OBOT_OIDC_AUTH_PROVIDER_ISSUER_URL,OBOT_AUTH_PROVIDER_COOKIE_SECRET,OBOT_AUTH_PROVIDER_EMAIL_DOMAINS
+Metadata: noUserAuth: generic-oidc-auth-provider
+Credential: ../placeholder-credential as generic-oidc-auth-provider
+
+#!sys.daemon ${GPTSCRIPT_TOOL_DIR}/bin/gptscript-go-tool
+
+---
+!metadata:OpenID Connect:providerMeta
+{
+    "icon": "https://cdn.jsdelivr.net/npm/simple-icons@v13/icons/openid.svg",
+    "iconDark": "https://cdn.jsdelivr.net/npm/simple-icons@v13/icons/openid.svg",
+    "link": "https://openid.net/connect/",
+    "postgresTablePrefix": "oidc_",
+    "envVars": [
+        {
+            "name": "OBOT_OIDC_AUTH_PROVIDER_ISSUER_URL",
+            "friendlyName": "Issuer URL",
+            "description": "The OIDC issuer URL. Endpoints are discovered from {issuer}/.well-known/openid-configuration. For Keycloak this is https://<host>/realms/<realm>.",
+            "sensitive": false
+        },
+        {
+            "name": "OBOT_OIDC_AUTH_PROVIDER_CLIENT_ID",
+            "friendlyName": "Client ID",
+            "description": "Client ID of the confidential OIDC client registered with your identity provider.",
+            "sensitive": false
+        },
+        {
+            "name": "OBOT_OIDC_AUTH_PROVIDER_CLIENT_SECRET",
+            "friendlyName": "Client Secret",
+            "description": "Client secret for the OIDC client.",
+            "sensitive": true
+        },
+        {
+            "name": "OBOT_AUTH_PROVIDER_COOKIE_SECRET",
+            "friendlyName": "Cookie Secret",
+            "description": "Secret used to encrypt cookies. Must be a random string of length 16, 24, or 32.",
+            "sensitive": true,
+            "hidden": true
+        },
+        {
+            "name": "OBOT_AUTH_PROVIDER_EMAIL_DOMAINS",
+            "friendlyName": "Allowed E-Mail Domains",
+            "description": "A list of email domains that are allowed to authenticate with this provider. * is a special value that allows all domains.",
+            "sensitive": false
+        }
+    ],
+    "optionalEnvVars": [
+        {
+            "name": "OBOT_OIDC_AUTH_PROVIDER_SCOPES",
+            "friendlyName": "Scopes",
+            "description": "Space-separated OAuth scopes to request. Default: openid email profile",
+            "sensitive": false
+        },
+        {
+            "name": "OBOT_OIDC_AUTH_PROVIDER_EMAIL_CLAIM",
+            "friendlyName": "Email Claim",
+            "description": "The OIDC claim containing the user's email. Default: email",
+            "sensitive": false
+        },
+        {
+            "name": "OBOT_OIDC_AUTH_PROVIDER_GROUPS_CLAIM",
+            "friendlyName": "Groups Claim",
+            "description": "The OIDC claim containing the user's groups. Default: groups",
+            "sensitive": false
+        },
+        {
+            "name": "OBOT_OIDC_AUTH_PROVIDER_ALLOW_UNVERIFIED_EMAIL",
+            "friendlyName": "Allow Unverified Email",
+            "description": "Allow users whose email_verified claim is not true to sign in. Many self-hosted IdPs do not set email_verified. Default: true",
+            "sensitive": false
+        },
+        {
+            "name": "OBOT_AUTH_PROVIDER_POSTGRES_CONNECTION_DSN",
+            "friendlyName": "PostgreSQL connection string (DSN)",
+            "description": "The connection string for a PostgreSQL database to use for session storage. If unset, cookies will be used for session storage instead.",
+            "sensitive": true,
+            "hidden": true
+        },
+        {
+            "name": "OBOT_AUTH_PROVIDER_TOKEN_REFRESH_DURATION",
+            "friendlyName": "Token Refresh Duration",
+            "description": "Time to wait before attempting to refresh auth tokens. Should be in a format like 1h1m1s. Default: 1h",
+            "sensitive": false
+        },
+        {
+            "name": "OBOT_AUTH_PROVIDER_ENABLE_LOGGING",
+            "friendlyName": "Enable Logging",
+            "description": "Set to true to enable request, auth, and standard logging for the auth provider. Default: false",
+            "sensitive": false
+        }
+    ]
+}

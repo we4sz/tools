@@ -19,6 +19,8 @@ modelProviders:
     reference: ./generic-openai-model-provider
 
 authProviders:
+  generic-oidc-auth-provider:
+    reference: ./generic-oidc-auth-provider
   github-auth-provider:
     reference: ./github-auth-provider
   google-auth-provider:
