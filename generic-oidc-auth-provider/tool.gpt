@@ -66,6 +66,12 @@ Credential: ../placeholder-credential as generic-oidc-auth-provider
             "sensitive": false
         },
         {
+            "name": "OBOT_OIDC_AUTH_PROVIDER_GROUP_ADMIN",
+            "friendlyName": "Group Admin (IdP)",
+            "description": "Opt in to IdP admin-API group features: enumerate all groups for the admin group picker, and resolve each user's real group memberships. Only supported value: keycloak. Requires the OIDC client to have a service account with realm-management roles query-groups and view-users. Leave empty to use only the groups claim from the token (any OIDC IdP).",
+            "sensitive": false
+        },
+        {
             "name": "OBOT_OIDC_AUTH_PROVIDER_ALLOW_UNVERIFIED_EMAIL",
             "friendlyName": "Allow Unverified Email",
             "description": "Allow users whose email_verified claim is not true to sign in. Many self-hosted IdPs do not set email_verified. Default: true",

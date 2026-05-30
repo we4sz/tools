@@ -36,6 +36,15 @@ type Options struct {
 	// AllowUnverifiedEmail lets users without email_verified=true sign in.
 	// Many self-hosted IdPs (e.g. Keycloak) do not set email_verified by default.
 	AllowUnverifiedEmail string `env:"OBOT_OIDC_AUTH_PROVIDER_ALLOW_UNVERIFIED_EMAIL" default:"true" optional:"true"`
+	// GroupAdmin opts in to IdP admin-API group features: enumerating all groups
+	// for Obot's admin group picker, and resolving a specific user's real group
+	// memberships. Generic OIDC has no standard endpoint for either, so this is
+	// vendor-specific. The only supported value is "keycloak", which uses the
+	// OIDC client's own service account (client_credentials) against the Keycloak
+	// Admin API — the client must have realm-management roles query-groups and
+	// view-users. Leave empty to rely solely on the token's groups claim (works
+	// with any OIDC IdP, same as the OSS Google/GitHub providers).
+	GroupAdmin string `env:"OBOT_OIDC_AUTH_PROVIDER_GROUP_ADMIN" default:"" optional:"true"`
 
 	ObotServerURL            string `env:"OBOT_SERVER_PUBLIC_URL,OBOT_SERVER_URL"`
 	PostgresConnectionDSN    string `env:"OBOT_AUTH_PROVIDER_POSTGRES_CONNECTION_DSN" optional:"true"`
@@ -319,6 +328,9 @@ func main() {
 	}
 
 	issuerURL := strings.TrimRight(opts.IssuerURL, "/")
+	// Opt-in, vendor-specific group admin (enumeration + per-user lookup). When
+	// off, the provider is pure generic OIDC: groups come only from the token claim.
+	keycloakGroupAdmin := strings.EqualFold(strings.TrimSpace(opts.GroupAdmin), "keycloak")
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/{$}", func(w http.ResponseWriter, r *http.Request) {
@@ -335,29 +347,34 @@ func main() {
 		json.NewEncoder(w).Encode(userInfo)
 	})
 	// /obot-list-auth-groups: enumerate ALL realm groups for the admin group
-	// picker (group-scoped registries / role assignments). Obot merges this with
-	// its DB cache, so on error we return an empty list rather than failing.
+	// picker (group-scoped registries / role assignments). Only meaningful with an
+	// IdP admin API (opt-in); generic OIDC has no such endpoint, so we return an
+	// empty list and Obot falls back to the groups it has discovered in its DB.
 	mux.HandleFunc("/obot-list-auth-groups", func(w http.ResponseWriter, r *http.Request) {
-		groups, err := listIdPGroupsViaKeycloakAdmin(r.Context(), issuerURL, opts.ClientID, opts.ClientSecret, r.URL.Query().Get("name"))
-		if err != nil {
-			groups = state.GroupInfoList{}
+		groups := state.GroupInfoList{}
+		if keycloakGroupAdmin {
+			if g, err := listIdPGroupsViaKeycloakAdmin(r.Context(), issuerURL, opts.ClientID, opts.ClientSecret, r.URL.Query().Get("name")); err == nil {
+				groups = g
+			}
 		}
 		json.NewEncoder(w).Encode(groups)
 	})
 	// /obot-list-user-auth-groups: the groups a SPECIFIC user belongs to. Obot
 	// POSTs the provider user ID (Keycloak user UUID) as the request body and uses
 	// the result to sync that user's memberships — so we must return ONLY that
-	// user's groups. For Keycloak we look them up via the admin API; otherwise we
-	// fall back to the groups claim in a bearer token if one was forwarded.
+	// user's groups. With the Keycloak group admin opted in we look them up via the
+	// admin API; otherwise we fall back to the groups claim in a forwarded token.
 	mux.HandleFunc("/obot-list-user-auth-groups", func(w http.ResponseWriter, r *http.Request) {
-		var userID string
-		if r.Body != nil {
-			body, _ := io.ReadAll(r.Body)
-			userID = strings.TrimSpace(string(body))
-		}
-		if groups, err := listKeycloakUserGroups(r.Context(), issuerURL, opts.ClientID, opts.ClientSecret, userID); err == nil {
-			json.NewEncoder(w).Encode(groups)
-			return
+		if keycloakGroupAdmin {
+			var userID string
+			if r.Body != nil {
+				body, _ := io.ReadAll(r.Body)
+				userID = strings.TrimSpace(string(body))
+			}
+			if groups, err := listKeycloakUserGroups(r.Context(), issuerURL, opts.ClientID, opts.ClientSecret, userID); err == nil {
+				json.NewEncoder(w).Encode(groups)
+				return
+			}
 		}
 		// Fallback for non-Keycloak IdPs: the caller's own groups from a forwarded
 		// token (JWT claim, then userinfo). Never returns the whole realm.
