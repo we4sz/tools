@@ -39,11 +39,12 @@ type Options struct {
 	// GroupAdmin opts in to IdP admin-API group features: enumerating all groups
 	// for Obot's admin group picker, and resolving a specific user's real group
 	// memberships. Generic OIDC has no standard endpoint for either, so this is
-	// vendor-specific. The only supported value is "keycloak", which uses the
-	// OIDC client's own service account (client_credentials) against the Keycloak
-	// Admin API — the client must have realm-management roles query-groups and
-	// view-users. Leave empty to rely solely on the token's groups claim (works
-	// with any OIDC IdP, same as the OSS Google/GitHub providers).
+	// vendor-specific. Set to "keycloak" to enable (the only backend today); it
+	// uses the OIDC client's own service account (client_credentials) against the
+	// Keycloak Admin API — the client must have realm-management roles query-groups
+	// and view-users. Leave empty to rely solely on the token's groups claim (works
+	// with any OIDC IdP, same as the OSS Google/GitHub providers). See
+	// groupAdminEnabled for accepted values.
 	GroupAdmin string `env:"OBOT_OIDC_AUTH_PROVIDER_GROUP_ADMIN" default:"" optional:"true"`
 
 	ObotServerURL            string `env:"OBOT_SERVER_PUBLIC_URL,OBOT_SERVER_URL"`
@@ -52,6 +53,20 @@ type Options struct {
 	AuthEmailDomains         string `usage:"Email domains allowed for authentication" default:"*" env:"OBOT_AUTH_PROVIDER_EMAIL_DOMAINS"`
 	AuthTokenRefreshDuration string `usage:"Duration to refresh auth token after" optional:"true" default:"1h" env:"OBOT_AUTH_PROVIDER_TOKEN_REFRESH_DURATION"`
 	LoggingEnabled           string `usage:"Enable oauth2-proxy logging" optional:"true" env:"OBOT_AUTH_PROVIDER_ENABLE_LOGGING"`
+}
+
+// groupAdminEnabled reports whether the IdP admin-API group features are opted
+// in. The canonical value is the backend name "keycloak"; common truthy values
+// are also accepted so a stray "true"/"yes" still works. Anything unrecognized
+// (blank, a typo, an unsupported backend) is treated as off — that only disables
+// group enumeration / membership lookup, it never blocks login.
+func groupAdminEnabled(v string) bool {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "keycloak", "true", "1", "yes", "on", "enabled":
+		return true
+	default:
+		return false
+	}
 }
 
 // groupsFromBearerToken decodes a JWT bearer token (signature NOT verified —
@@ -330,7 +345,7 @@ func main() {
 	issuerURL := strings.TrimRight(opts.IssuerURL, "/")
 	// Opt-in, vendor-specific group admin (enumeration + per-user lookup). When
 	// off, the provider is pure generic OIDC: groups come only from the token claim.
-	keycloakGroupAdmin := strings.EqualFold(strings.TrimSpace(opts.GroupAdmin), "keycloak")
+	keycloakGroupAdmin := groupAdminEnabled(opts.GroupAdmin)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/{$}", func(w http.ResponseWriter, r *http.Request) {

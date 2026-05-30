@@ -67,8 +67,8 @@ Credential: ../placeholder-credential as generic-oidc-auth-provider
         },
         {
             "name": "OBOT_OIDC_AUTH_PROVIDER_GROUP_ADMIN",
-            "friendlyName": "Group Admin (IdP)",
-            "description": "Opt in to IdP admin-API group features: enumerate all groups for the admin group picker, and resolve each user's real group memberships. Only supported value: keycloak. Requires the OIDC client to have a service account with realm-management roles query-groups and view-users. Leave empty to use only the groups claim from the token (any OIDC IdP).",
+            "friendlyName": "Group Admin (IdP) — enter: keycloak",
+            "description": "Enter 'keycloak' to enable IdP admin-API group features: enumerate all groups for the admin group picker, and resolve each user's real group memberships. 'keycloak' is the only supported backend today and requires the OIDC client to have a service account with realm-management roles query-groups and view-users. Leave this blank for any other IdP — groups then come only from the token claim (default). An unrecognized value is treated as blank and never blocks login.",
             "sensitive": false
         },
         {
